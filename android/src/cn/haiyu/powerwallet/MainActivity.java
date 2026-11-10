@@ -7,14 +7,11 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
-import android.os.IBinder;
-import android.os.Parcel;
 import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import java.io.*;
 
 public class MainActivity extends Activity {
     public static final String SOCKET = "cn.haiyu.powerwallet.v1";
@@ -39,13 +36,18 @@ public class MainActivity extends Activity {
         status.setPadding(dp(20), dp(20), dp(20), dp(20));
         GradientDrawable bg = new GradientDrawable(); bg.setColor(0xFFE0EDE2); bg.setCornerRadius(dp(18)); status.setBackground(bg);
         button(root, "打开 Google 钱包", new View.OnClickListener() { public void onClick(View v) { openWallet(); }});
-        button(root, "刷新激活状态", new View.OnClickListener() { public void onClick(View v) { request("STATUS"); }});
-        button(root, "停用并恢复原快捷键", new View.OnClickListener() { public void onClick(View v) {
-            new AlertDialog.Builder(MainActivity.this).setTitle("恢复原快捷键？")
-                .setMessage("停止按键助手，并恢复激活前的双击电源键设置。")
+        TextView modeLabel = text(root, "双击电源键打开", 14, true, 0xFF466E5A);
+        modeLabel.setPadding(0, dp(22), 0, 0);
+        button(root, "Google 钱包", new View.OnClickListener() { public void onClick(View v) { status.setText("正在切换…"); request("MODE google"); }});
+        button(root, "小米钱包", new View.OnClickListener() { public void onClick(View v) { status.setText("正在切换…"); request("MODE mi"); }});
+        button(root, "配对无线调试（首次设置）", new View.OnClickListener() { public void onClick(View v) { wireless(); }});
+        button(root, "刷新状态", new View.OnClickListener() { public void onClick(View v) { status.setText("正在读取…"); request("REFRESH"); }});
+        button(root, "恢复原设置", new View.OnClickListener() { public void onClick(View v) {
+            new AlertDialog.Builder(MainActivity.this).setTitle("恢复原设置？")
+                .setMessage("把双击电源键和默认付款应用恢复为本应用第一次修改前的值。")
                 .setPositiveButton("恢复", (d,w) -> request("STOP")).setNegativeButton("取消", null).show();
         }});
-        TextView help = text(root, "使用说明\n\n激活后可拔掉数据线。手机重启后，需要连接电脑重新运行“激活.ps1”。\n\n锁屏时请按 Google 钱包要求完成指纹或密码验证。插件不读取银行卡，也不处理付款。\n\n卸载前请先点“停用并恢复原快捷键”。", 14, false, 0xFF536357);
+        TextView help = text(root, "使用说明\n\n首次使用：点「配对无线调试」，按提示在通知栏输入配对码。之后切换模式不需要电脑，但需要连接 Wi-Fi（应用会临时打开无线调试，完成后关闭）。\n\nHyperOS 每次开机会清除 Google 钱包的双击设置，应用会在开机并连上 Wi-Fi 后自动写回。请在应用设置中允许「自启动」，省电策略设为「无限制」。\n\n小米钱包模式由系统原生保存，重启不受影响。要长期使用小米钱包，请在本应用中切换（系统设置里改成小米钱包会在重启后被改回 Google 钱包）；改成其他功能（如相机）不会被覆盖。\n\n锁屏时请按钱包要求完成验证。本应用不读取银行卡，也不处理付款。", 14, false, 0xFF536357);
         help.setPadding(0, dp(26), 0, 0);
         setContentView(scroll);
     }
@@ -60,6 +62,26 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, dp(56)); p.topMargin = dp(12);
         root.addView(b,p); b.setOnClickListener(listener);
     }
+    private void wireless() {
+        if(android.os.Build.VERSION.SDK_INT<30) { new AlertDialog.Builder(this).setMessage("无线调试需要 Android 11 及以上。").setPositiveButton("知道了",null).show(); return; }
+        if(android.os.Build.VERSION.SDK_INT>=33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS")!=android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"},1); return;
+        }
+        WirelessService.start(this);
+        new AlertDialog.Builder(this).setTitle("配对无线调试")
+            .setMessage("1. 连接 Wi-Fi，打开 开发者选项 → 无线调试。\n2. 点「使用配对码配对设备」，保持弹窗打开。\n3. 下拉通知栏，在「电源键钱包」通知里输入 6 位配对码。\n\n只需配对一次。")
+            .setPositiveButton("打开开发者选项", (d,w) -> openDeveloperOptions()).setNegativeButton("关闭", null).show();
+    }
+    private void openDeveloperOptions() {
+        Intent i=new Intent(android.provider.Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        Bundle args=new Bundle(); args.putString(":settings:fragment_args_key","toggle_adb_wireless");
+        i.putExtra(":settings:fragment_args_key","toggle_adb_wireless").putExtra(":settings:show_fragment_args",args);
+        try { startActivity(i); } catch(Exception e) { startActivity(new Intent(android.provider.Settings.ACTION_SETTINGS)); }
+    }
+    @Override public void onRequestPermissionsResult(int code, String[] p, int[] r) {
+        if(code==1) { if(r.length>0 && r[0]==android.content.pm.PackageManager.PERMISSION_GRANTED) wireless();
+            else new AlertDialog.Builder(this).setMessage("需要通知权限才能在通知栏输入配对码。").setPositiveButton("知道了",null).show(); }
+    }
     private void openWallet() {
         try { startActivity(new Intent("com.google.android.apps.wallet.main.QUICKDRAW").setPackage(WALLET)); }
         catch (Exception first) {
@@ -71,18 +93,14 @@ public class MainActivity extends Activity {
         if(busy) return; busy = true;
         new Thread(() -> {
             String reply;
+            // Native mode: shell writes via the phone's own wireless debugging (see SelfAdb).
             try {
-                IBinder helper=BridgeProvider.helper;
-                if(helper==null || !helper.isBinderAlive()) throw new IOException();
-                Parcel data=Parcel.obtain(), response=Parcel.obtain();
-                try {
-                    data.writeInterfaceToken("cn.haiyu.powerwallet.Control");
-                    if(!helper.transact("STOP".equals(command)?2:1,data,response,0)) throw new IOException();
-                    response.readException(); reply=response.readString();
-                    if(reply==null) throw new IOException();
-                } finally {data.recycle();response.recycle();}
-            } catch(Exception e) { reply = "未激活\n请连接电脑运行“激活.ps1”。"; }
-            final String result = reply.replace("|", "\n");
+                if(command.startsWith("MODE ")) reply=NativeMode.apply(this,"MODE google".equals(command));
+                else if("STOP".equals(command)) reply=NativeMode.restore(this);
+                else if("REFRESH".equals(command)) reply=NativeMode.refresh(this);
+                else reply=NativeMode.status(this);
+            } catch(Exception e) {reply="操作失败："+e.getMessage()+"\n\n"+NativeMode.status(this);}
+            final String result=reply;
             runOnUiThread(() -> { busy = false; status.setText(result); });
         }, "wallet-status").start();
     }
