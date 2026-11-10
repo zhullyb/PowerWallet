@@ -19,14 +19,52 @@ import java.util.regex.*;
 
 /** Runs as Android's ADB shell identity; never inside the ordinary app process. */
 public final class Helper {
-    private static final String KEY="double_click_power_key", MARKER="google_pay";
+    private static final String KEY="double_click_power_key";
     private static final File STATE=new File("/data/local/tmp/powerwallet-state.properties");
+    /** Validated device|incremental pairs. Others need POWERWALLET_ALLOW_UNVERIFIED=1. */
+    private static final String[] VERIFIED={"ishtar|OS3.0.308.0.WMACNXM","dada|OS4.0.0.22.XOCCNXM"};
+    private static final String MARKER=markerValue(), MI="mi_pay";
+    /** Our two owned values: Google mode (MARKER, a no-op the helper fills) or native Mi Pay mode. */
+    private static boolean ours(String v) {return MARKER.equals(v) || MI.equals(v);}
+    /** Default NFC payment service that goes with each mode (Settings.Secure nfc_payment_default_component). */
+    private static final String NFC_KEY="nfc_payment_default_component",
+        GOOGLE_NFC="com.google.android.gms/com.google.android.gms.tapandpay.hce.service.TpHceService",
+        MI_NFC="com.android.nfc/com.android.nfc.cardemulation.ESEWalletDummyService";
+    private static boolean ourNfc(String v) {return GOOGLE_NFC.equals(v) || MI_NFC.equals(v);}
+    private static String nfc() throws Exception {return command("/system/bin/settings","--user","0","get","secure",NFC_KEY);}
+    private static void putNfc(String value) throws Exception {
+        if(value==null) return;
+        if("null".equals(value)) command("/system/bin/settings","--user","0","delete","secure",NFC_KEY);
+        else command("/system/bin/settings","--user","0","put","secure",NFC_KEY,value);
+    }
+    private static boolean nfcServiceExists(String component) {
+        try {return command("/system/bin/dumpsys","nfc").contains("ComponentInfo{"+component+"}");} catch(Exception e) {return false;}
+    }
+    /** Switches the default payment app along with the mode, unless the user picked a third app. */
+    private static String applyNfc(String mode) throws Exception {
+        String current=nfc(), target=MI.equals(mode)?MI_NFC:GOOGLE_NFC;
+        if(target.equals(current)) return "unchanged";
+        if(!ourNfc(current)) return "kept "+current;
+        if(!nfcServiceExists(target)) return "missing "+target;
+        putNfc(target);
+        return target.equals(nfc()) ? "set "+target : "failed";
+    }
+    private static String markerValue() {
+        String m=System.getenv("POWERWALLET_MARKER");
+        if(m==null || m.isEmpty()) {
+            Properties p=new Properties();
+            try(FileInputStream in=new FileInputStream(STATE)){p.load(in);m=p.getProperty("marker");}catch(Exception ignored){}
+        }
+        if(m==null || m.isEmpty()) m="google_pay";
+        if(!m.matches("[a-z_]{1,40}")) throw new IllegalArgumentException("Invalid marker");
+        return m;
+    }
     private final PressDetector detector=new PressDetector();
     private volatile boolean running=true;
     private volatile String last="尚未触发";
     private volatile int launches=0;
     private int appUid;
-    private String original, inputPath;
+    private String original, inputPath, mode;
     private Process reader;
     private LocalServerSocket server;
     private Object activityManager;
@@ -34,12 +72,12 @@ public final class Helper {
     private final IBinder providerToken=new Binder();
     private final Binder control=new Binder() {
         @Override protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
-            if(code!=1 && code!=2) return super.onTransact(code,data,reply,flags);
+            if(code<1 || code>3) return super.onTransact(code,data,reply,flags);
             int caller=Binder.getCallingUid();
             if(caller!=appUid && caller!=2000) throw new SecurityException("Untrusted caller");
             data.enforceInterface("cn.haiyu.powerwallet.Control");
             try {
-                String value=code==2 ? (restore()?"已停用，并恢复原快捷键":"已停用，保留当前新快捷键") : status();
+                String value=code==2 ? (restore()?"已停用，并恢复原快捷键":"已停用，保留当前新快捷键") : code==3 ? setMode(data.readString()) : status();
                 reply.writeNoException(); reply.writeString(value);
                 if(code==2) timer.schedule(() -> shutdown(),100,TimeUnit.MILLISECONDS);
             } catch(Exception e) {reply.writeException(new IllegalStateException(e));}
@@ -56,6 +94,28 @@ public final class Helper {
         }
     }
     private static void execute(String[] args) throws Exception {
+        if(args.length>1 && "--mode".equals(args[0])) {
+            try(LocalSocket s=new LocalSocket()) {
+                s.connect(new LocalSocketAddress(MainActivity.SOCKET)); s.setSoTimeout(4000);
+                s.getOutputStream().write(("MODE "+args[1]+"\n").getBytes(StandardCharsets.UTF_8));
+                String reply=new BufferedReader(new InputStreamReader(s.getInputStream())).readLine();
+                if(reply==null) throw new IOException("Helper closed without a response");
+                System.out.println(reply);
+                if(!reply.startsWith("已激活")) System.exit(1);
+            }
+            return;
+        }
+        if(args.length>0 && "--handoff".equals(args[0])) {
+            // Re-activation: stop the running helper WITHOUT restoring, so the backup stays authoritative.
+            try(LocalSocket s=new LocalSocket()) {
+                s.connect(new LocalSocketAddress(MainActivity.SOCKET)); s.setSoTimeout(4000);
+                s.getOutputStream().write("HANDOFF\n".getBytes(StandardCharsets.UTF_8));
+                String reply=new BufferedReader(new InputStreamReader(s.getInputStream())).readLine();
+                System.out.println(reply);
+                if(reply==null || !reply.startsWith("已交接")) System.exit(1); // Older helper: caller falls back to --stop.
+            }
+            return;
+        }
         if(args.length>0 && ("--stop".equals(args[0]) || "--status".equals(args[0]) || "--restore".equals(args[0]))) {
             boolean restoring="--restore".equals(args[0]);
             try(LocalSocket s=new LocalSocket()) {
@@ -66,7 +126,8 @@ public final class Helper {
                 System.out.println(reply);
             } catch(IOException unavailable) {
                 if(!restoring) throw unavailable;
-                if(!MARKER.equals(setting())) {System.out.println("已停用，保留当前快捷键");return;}
+                restoreNfc();
+                if(!ours(setting())) {System.out.println("已停用，保留当前快捷键");return;}
                 Properties backup=new Properties();
                 try(FileInputStream in=new FileInputStream(STATE)){backup.load(in);}
                 String previous=backup.getProperty("original");
@@ -100,9 +161,9 @@ public final class Helper {
     }
     private void run() throws Exception {
         if(android.os.Process.myUid()!=2000) throw new SecurityException("ADB activation required");
-        if(!"ishtar".equals(command("/system/bin/getprop","ro.product.device")) ||
-           !"OS3.0.308.0.WMACNXM".equals(command("/system/bin/getprop","ro.build.version.incremental")))
-            throw new IOException("This build is validated only for Xiaomi 13 Ultra OS3.0.308.0.WMACNXM");
+        String build=command("/system/bin/getprop","ro.product.device")+"|"+command("/system/bin/getprop","ro.build.version.incremental");
+        if(!Arrays.asList(VERIFIED).contains(build) && !"1".equals(System.getenv("POWERWALLET_ALLOW_UNVERIFIED")))
+            throw new IOException("Unverified build "+build+"; set POWERWALLET_ALLOW_UNVERIFIED=1 after checking the marker is a no-op");
         server=new LocalServerSocket(MainActivity.SOCKET); // Exclusive instance before any changes.
         String packages=command("/system/bin/cmd","package","list","packages","-U", "cn.haiyu.powerwallet");
         Matcher uid=Pattern.compile("package:cn\\.haiyu\\.powerwallet uid:(\\d+)").matcher(packages);
@@ -112,20 +173,27 @@ public final class Helper {
         Properties props=new Properties();
         if(STATE.exists()) try(FileInputStream in=new FileInputStream(STATE)){props.load(in);}
         original=props.getProperty("original");
-        if(original==null || !MARKER.equals(setting())) original=setting();
-        props.setProperty("original",original); props.setProperty("device",inputPath);
+        String current=setting();
+        // HyperOS resets unrecognised values (our google_pay marker) to null at boot; keep the backup then.
+        if(original==null || (!ours(current) && !"null".equals(current))) original=current;
+        mode=MI.equals(props.getProperty("mode")) ? MI : MARKER;
+        props.setProperty("original",original); props.setProperty("device",inputPath); props.setProperty("marker",MARKER);
+        props.setProperty("mode",mode);
+        String currentNfc=nfc();
+        if(props.getProperty("nfcOriginal")==null || !ourNfc(currentNfc)) props.setProperty("nfcOriginal",currentNfc);
         try(FileOutputStream out=new FileOutputStream(STATE)){props.store(out,"PowerWallet reversible shortcut backup");}
         STATE.setReadable(false,false); STATE.setReadable(true,true); STATE.setWritable(false,false); STATE.setWritable(true,true);
         reader=new ProcessBuilder("/system/bin/getevent","-lt",inputPath).redirectErrorStream(true).start();
         Thread.sleep(100);
         if(!reader.isAlive()) throw new IOException("Power-key input is unavailable");
-        putSetting(MARKER); // This exact ROM implements this action as a no-op, consuming the original wallet shortcut.
+        System.out.println("NFC "+applyNfc(mode));
+        putSetting(mode); // MARKER is a no-op on validated ROMs, consuming the system wallet shortcut; MI keeps it native.
         bindProvider();
         new Thread(() -> socketLoop(),"wallet-control").start();
         timer.scheduleAtFixedRate(() -> {
             if(running && detector.poll(SystemClock.uptimeMillis())) launch();
         },20,20,TimeUnit.MILLISECONDS);
-        System.out.println("READY uid="+appUid+" input="+inputPath+" original="+original);
+        System.out.println("READY uid="+appUid+" input="+inputPath+" original="+original+" mode="+mode);
         Pattern event=Pattern.compile("\\[\\s*([0-9]+\\.[0-9]+)\\]\\s+(?:/dev/input/event\\d+:\\s+)?EV_KEY\\s+KEY_POWER\\s+(DOWN|UP)");
         try(BufferedReader in=new BufferedReader(new InputStreamReader(reader.getInputStream()))) {
             String line;
@@ -159,7 +227,24 @@ public final class Helper {
         System.out.println("BRIDGE_READY");
     }
     private String status() throws Exception {
-        return (MARKER.equals(setting()) ? "已激活 · 数据线可拔出" : "快捷键已改变 · 请重新激活")+"|已触发 "+launches+" 次 · "+last;
+        String v=setting();
+        String head=MARKER.equals(v) ? "已激活 · 双击打开 Google 钱包" : MI.equals(v) ? "已激活 · 双击打开小米钱包（系统原生）" : "快捷键已改变 · 请重新激活";
+        String n=nfc();
+        String pay=GOOGLE_NFC.equals(n)?"Google 钱包":MI_NFC.equals(n)?"小米钱包":"其他应用（未改动）";
+        return head+"|默认付款：" +pay+"|已触发 "+launches+" 次 · "+last;
+    }
+    private synchronized String setMode(String requested) throws Exception {
+        String target="google".equals(requested) ? MARKER : "mi".equals(requested) ? MI : null;
+        if(target==null) throw new IllegalArgumentException("Unknown mode");
+        if(!ours(setting())) return status(); // Respect a setting the user changed elsewhere.
+        putSetting(target); mode=target;
+        System.out.println("NFC "+applyNfc(target));
+        Properties props=new Properties();
+        try(FileInputStream in=new FileInputStream(STATE)){props.load(in);}
+        props.setProperty("mode",target);
+        try(FileOutputStream out=new FileOutputStream(STATE)){props.store(out,"PowerWallet reversible shortcut backup");}
+        System.out.println("MODE "+target);
+        return status();
     }
     private String findPowerDevice() throws Exception {
         String desc=command("/system/bin/getevent","-lp");
@@ -177,7 +262,9 @@ public final class Helper {
     }
     private void launch() {
         try {
-            if(!MARKER.equals(setting())) {last="快捷键已被系统或用户更改，请重新激活"; return;}
+            String v=setting();
+            if(MI.equals(v)) return; // System opens Mi Pay natively.
+            if(!MARKER.equals(v)) {last="快捷键已被系统或用户更改，请重新激活"; return;}
             command("/system/bin/input","keyevent","KEYCODE_WAKEUP");
             Bundle before=keyguardState();
             boolean repaired=dismissAuthenticatedKeyguard(before);
@@ -230,16 +317,29 @@ public final class Helper {
                 String reply;
                 if("STATUS".equals(cmd)) reply=status();
                 else if("STOP".equals(cmd)) reply=restore() ? "已停用，并恢复原快捷键" : "已停用，保留当前新快捷键";
+                else if(cmd!=null && cmd.startsWith("MODE ")) reply=setMode(cmd.substring(5).trim());
+                else if("HANDOFF".equals(cmd)) reply="已交接";
                 else reply="Unsupported request";
                 socket.getOutputStream().write((reply+"\n").getBytes(StandardCharsets.UTF_8));
                 socket.getOutputStream().flush();
-                if("STOP".equals(cmd)) {shutdown(); return;}
+                if("STOP".equals(cmd) || "HANDOFF".equals(cmd)) {shutdown(); return;}
             } catch(Exception e) {if(running) System.out.println("CONTROL_ERROR "+e);}
         }
     }
     private synchronized boolean restore() throws Exception {
-        if(!MARKER.equals(setting())) return false;
-        putSetting(original); return true;
+        restoreNfc();
+        if(!ours(setting())) return false;
+        String backup=null;
+        try(FileInputStream in=new FileInputStream(STATE)){Properties p=new Properties();p.load(in);backup=p.getProperty("original");}catch(Exception ignored){}
+        putSetting(backup!=null?backup:original); return true;
+    }
+    private static void restoreNfc() {
+        try {
+            Properties p=new Properties();
+            try(FileInputStream in=new FileInputStream(STATE)){p.load(in);}
+            String original=p.getProperty("nfcOriginal");
+            if(original!=null && ourNfc(nfc()) && !original.equals(nfc())) putNfc(original);
+        } catch(Exception e) {System.out.println("NFC_RESTORE_ERROR "+e);}
     }
     private void shutdown() {
         running=false; timer.shutdownNow();
