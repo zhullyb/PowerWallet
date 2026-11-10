@@ -2,32 +2,56 @@
 
 双击小米手机电源键，直接打开 **Google 钱包刷卡页面**。Windows 图形工具内置 ADB 和手机插件，可安装、激活、检查状态，或恢复原快捷键，无需 root。
 
-## 本 fork：小米 15 / HyperOS 4 免助手方案（插件 1.3.0）
+## 本 fork：小米 15 / HyperOS 4
 
-在小米 15（dada）国行 HyperOS `OS4.0.0.22.XOCCNXM`（Android 17）上验证：
+**一句话：用 adb shell 把系统设置 `double_click_power_key` 改成 `launch_QAW_wallet`，双击电源键就会打开 Google 钱包。** 插件做的事情，就是在需要的时候替你执行这条命令。
 
-- 系统快捷键功能列表里原生存在 `launch_QAW_wallet`（Quick Access Wallet）。把 `double_click_power_key` 设为它，**解锁和锁屏双击都会直接打开 Google 钱包**，不再需要后台监听按键的助手进程。
-- 该设置位于 System 表且不是公开项，普通应用无权写入（`You cannot keep your settings in the secure settings.`），只能由 shell 修改。插件因此内置了一个纯 Java 的 adb 客户端：在通知栏输入无线调试配对码完成**一次**配对后，切换模式时插件会临时打开无线调试、连接本机 adbd、执行 `settings put`，完成后再关闭无线调试，全程不需要电脑。
-- HyperOS 开机时可能把 `launch_QAW_wallet` 清为 `null`（日志：`function not support`）或填成默认的 `mi_pay`。插件在开机并连上 Wi-Fi 后会自动写回 Google 钱包模式；系统设置里改成其他功能（如相机）不会被覆盖。想长期使用小米钱包，请在插件中切换。
-- 切换模式时同步修改默认 NFC 付款应用（Google Pay ↔ 小米钱包 `ESEWalletDummyService`），若用户选了第三方付款应用则不改动。
+### 原生 Android 的机制
+
+- Android 11 引入了 Quick Access Wallet（QAW）：钱包应用实现一个 `QuickAccessWalletService`，系统就能直接调起它。
+- 按 AOSP 的实现，系统并不固定打开某个钱包，而是读取**默认 NFC 付款应用**，再去这个应用里找 QAW 服务。Google Pay 的 QAW 服务由 Play 服务提供，打开的是 Google 钱包。（这一点在小米 15 上尚未单独验证。）
+- 原生 Android 还支持「双击电源键打开钱包」，对应 Secure 表的 `double_tap_power_button_gesture=1`。
+
+### 小米做了什么
+
+- HyperOS 用自己的设置 `double_click_power_key`（System 表）决定双击电源键做什么，并把它同步到原生设置上。国行设置界面只提供 `mi_pay`（小米钱包）等选项。
+- 系统其实认识 `launch_QAW_wallet`（即原生的「打开钱包」），只是国行把它标记为 `disabledByCustFeature`，设置界面里不显示。
+- 开机时 HyperOS 会检查这个值，有时会把 `launch_QAW_wallet` 当成「不支持」清成 `null`，或者填回默认的 `mi_pay`。四次重启里出现过清空、保留、填回 `mi_pay` 三种结果。
+
+### 原项目做了什么
+
+原项目当时还不知道 `launch_QAW_wallet`，所以绕了一个大圈：
+
+1. 把 `double_click_power_key` 改成系统不认识的 `google_pay`，让系统的双击动作失效；
+2. 通过 adb 启动一个常驻的 shell 进程，监听电源键事件，自己识别双击；
+3. 识别到双击后，用 `am start` 打开 Google 钱包。
+
+这个进程在重启后就没了，所以每次重启都要用 adb 重新激活。在 HyperOS 4 上，`google_pay` 同样会在开机时被系统清掉。
+
+### 本 fork 做了什么
+
+- **改用系统原生的 `launch_QAW_wallet`**。不再需要常驻进程，锁屏验证也交给系统处理。
+- **切换模式时同步默认 NFC 付款应用**：Google 钱包模式对应 Google Pay（QAW 依赖它），小米钱包模式对应小米钱包。如果你选的是第三方付款应用，插件不会改动。
+- **插件自己执行 adb 命令**。普通 App 无权写这个设置（会报错 `You cannot keep your settings in the secure settings.`），所以插件内置了一个 adb 客户端。在通知栏输入一次无线调试配对码以后，切换模式时插件会临时打开无线调试、连接本机、执行 `settings put`，完成后再关闭无线调试。
+- **开机后自动写回**。如果你选的是 Google 钱包模式，开机并连上 Wi-Fi 后，插件会检查这个值：是 `null` 或 `mi_pay` 就写回 `launch_QAW_wallet`，是其他功能（比如相机）就不动。小米钱包模式（`mi_pay`）本身就能保持到重启后，插件什么都不用做。
 
 > [!IMPORTANT]
-> **切换模式和开机恢复都依赖 adb shell 权限（有线或无线调试均可），也就是说那一刻必须开着「开发者选项」和「USB 调试 / 无线调试」。**
-> 插件只是替你临时打开无线调试，并不能绕开这个前提。如果你日常会关闭开发者选项（例如 HSBC HK 等银行 App 不允许在开启开发者选项的手机上使用），需要注意：
+> **切换模式和开机写回都需要 adb shell 权限（有线或无线调试均可），也就是说那一刻必须开着「开发者选项」和「USB 调试 / 无线调试」。** 插件只是替你临时打开无线调试，并没有绕开这个前提。
 >
-> - 关闭开发者选项期间无法切换模式；
-> - 小米钱包模式（`mi_pay`）由系统原生保存，重启不受影响；
-> - Google 钱包模式在重启后可能被系统清掉（变成 `null` 或 `mi_pay`），在你重新打开开发者选项、连上 Wi-Fi 让插件写回之前，双击不会打开 Google 钱包；
-> - 关闭开发者选项后，已授予的 `WRITE_SECURE_SETTINGS` 和无线调试配对是否会被系统收回，尚未验证。
+> 如果你日常会关闭开发者选项（例如 HSBC HK 等银行 App 不允许在开启开发者选项的手机上使用）：
 >
-> 原项目的按键助手方案同样如此：每次重启后都需要通过 adb 重新激活。
+> - 关闭期间无法切换模式；
+> - 小米钱包模式重启后不受影响；
+> - Google 钱包模式在重启后可能被系统清掉，在你重新打开开发者选项、连上 Wi-Fi 让插件写回之前，双击不会打开 Google 钱包；
+> - 关闭开发者选项后，已授予的 `WRITE_SECURE_SETTINGS` 和无线调试配对会不会被收回，尚未验证。
 
-使用前提与注意：
+### 其他前提与说明
 
-- 需要 Wi-Fi（无线调试只能在 Wi-Fi 下工作）。请为插件允许「自启动」，省电策略设为「无限制」，否则开机广播可能被拦截、切到后台时会被冻结。
-- 插件因此**请求了网络权限**（仅连接 `127.0.0.1` 上的 adbd），并持有一把被 adbd 信任的密钥；可在开发者选项中「撤销 USB 调试授权」将其作废。下文原项目关于「APK 不请求网络权限」的说明不适用于本 fork。
-- 未覆盖的验证：开机时无 Wi-Fi 稍后才连接、全新安装后的完整配对流程、真实读卡器付款。
-- 原有的按键助手（`Helper`）保留，作为不支持 `launch_QAW_wallet` 的系统的后备，可用 `linux/powerwallet.sh` 构建和激活。
+- 需要 Wi-Fi（无线调试只能在 Wi-Fi 下工作）。请为插件允许「自启动」，省电策略设为「无限制」，否则开机广播可能被拦截，切到后台时也会被冻结。
+- 插件因此**请求了网络权限**（只连接 `127.0.0.1` 上的 adbd），并持有一把被 adbd 信任的密钥，可以在开发者选项中「撤销 USB 调试授权」作废它。下文原项目关于「APK 不请求网络权限」的说明不适用于本 fork。
+- 如果不想用插件，也可以手动执行：`adb shell settings put system double_click_power_key launch_QAW_wallet`。但重启后可能需要再执行一次。
+- 已在小米 15 国行 `OS4.0.0.22.XOCCNXM` 上验证：双击打开 Google 钱包（解锁 / 锁屏）、模式切换、NFC 联动、开机写回。尚未验证：开机时没有 Wi-Fi 稍后才连上、全新安装后的完整配对流程、真实读卡器付款。
+- 原项目的按键助手（`Helper`）保留，作为不支持 `launch_QAW_wallet` 的系统的后备，可以用 `linux/powerwallet.sh` 构建和激活。
 
 Linux 下构建：
 
