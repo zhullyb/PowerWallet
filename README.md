@@ -2,6 +2,33 @@
 
 双击小米手机电源键，直接打开 **Google 钱包刷卡页面**。Windows 图形工具内置 ADB 和手机插件，可安装、激活、检查状态，或恢复原快捷键，无需 root。
 
+## 本 fork：小米 15 / HyperOS 4 免助手方案（插件 1.3.0）
+
+在小米 15（dada）国行 HyperOS `OS4.0.0.22.XOCCNXM`（Android 17）上验证：
+
+- 系统快捷键功能列表里原生存在 `launch_QAW_wallet`（Quick Access Wallet）。把 `double_click_power_key` 设为它，**解锁和锁屏双击都会直接打开 Google 钱包**，不再需要后台监听按键的助手进程。
+- 该设置位于 System 表且不是公开项，普通应用无权写入（`You cannot keep your settings in the secure settings.`），只能由 shell 修改。插件因此内置了一个纯 Java 的 adb 客户端：在通知栏输入无线调试配对码完成**一次**配对后，切换模式时插件会临时打开无线调试、连接本机 adbd、执行 `settings put`，完成后再关闭无线调试，全程不需要电脑。
+- HyperOS 开机时可能把 `launch_QAW_wallet` 清为 `null`（日志：`function not support`）或填成默认的 `mi_pay`。插件在开机并连上 Wi-Fi 后会自动写回 Google 钱包模式；系统设置里改成其他功能（如相机）不会被覆盖。想长期使用小米钱包，请在插件中切换。
+- 切换模式时同步修改默认 NFC 付款应用（Google Pay ↔ 小米钱包 `ESEWalletDummyService`），若用户选了第三方付款应用则不改动。
+
+使用前提与注意：
+
+- 需要 Wi-Fi（无线调试只能在 Wi-Fi 下工作）。请为插件允许「自启动」，省电策略设为「无限制」，否则开机广播可能被拦截、切到后台时会被冻结。
+- 插件因此**请求了网络权限**（仅连接 `127.0.0.1` 上的 adbd），并持有一把被 adbd 信任的密钥；可在开发者选项中「撤销 USB 调试授权」将其作废。下文原项目关于「APK 不请求网络权限」的说明不适用于本 fork。
+- 未覆盖的验证：开机时无 Wi-Fi 稍后才连接、全新安装后的完整配对流程、真实读卡器付款。
+- 原有的按键助手（`Helper`）保留，作为不支持 `launch_QAW_wallet` 的系统的后备，可用 `linux/powerwallet.sh` 构建和激活。
+
+Linux 下构建：
+
+```bash
+ANDROID_HOME=/path/to/android-sdk linux/powerwallet.sh build   # 需要 JDK 17+、platform android-35、build-tools
+adb install -r linux/build/PowerWallet-linux.apk
+```
+
+以下为原项目说明。
+
+---
+
 **目前仅适配：小米 13 Ultra / ishtar，国行 HyperOS `OS3.0.308.0.WMACNXM`，Android 16。** 未适配的设备不会被激活。系统更新后需要重新验证兼容性。
 
 [下载 Windows EXE](https://github.com/DustinYe/PowerWallet/releases/latest) · [完整使用说明](docs/usage.md) · [验证记录](docs/verification.md)
